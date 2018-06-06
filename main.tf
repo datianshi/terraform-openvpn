@@ -45,7 +45,7 @@ variable "private_key" {}
 
 resource "aws_key_pair" "openvpn" {
   key_name   = "openvpn-key"
-  public_key = "${var.public_key}"
+  public_key = "${file("key.pub")}"
 }
 
 variable "ssh_user" {
@@ -62,6 +62,10 @@ variable "ssh_cidr" {
 
 variable "https_port" {
   default = 443
+}
+
+variable "http_port" {
+  default = 80
 }
 
 variable "https_cidr" {
@@ -113,6 +117,13 @@ resource "aws_security_group" "openvpn" {
     cidr_blocks = ["${var.tcp_cidr}"]
   }
 
+  ingress {
+    from_port   = "${var.http_port}"
+    to_port     = "${var.http_port}"
+    protocol    = "tcp"
+    cidr_blocks = ["${var.tcp_cidr}"]
+  }
+
   // open vpn udp
   ingress {
     from_port   = "${var.udp_port}"
@@ -130,31 +141,31 @@ resource "aws_security_group" "openvpn" {
   }
 }
 
-variable "route53_zone_name" {}
+# variable "route53_zone_name" {}
 variable "subdomain_name" {}
 
 variable "subdomain_ttl" {
   default = "60"
 }
 
-data "aws_route53_zone" "main" {
-  name = "${var.route53_zone_name}"
-}
+# data "aws_route53_zone" "main" {
+#   name = "${var.route53_zone_name}"
+# }
 
-resource "aws_route53_record" "vpn" {
-  zone_id = "${data.aws_route53_zone.main.zone_id}"
-  name    = "${var.subdomain_name}"
-  type    = "A"
-  ttl     = "${var.subdomain_ttl}"
-  records = ["${aws_instance.openvpn.public_ip}"]
-}
+# resource "aws_route53_record" "vpn" {
+#   zone_id = "${data.aws_route53_zone.main.zone_id}"
+#   name    = "${var.subdomain_name}"
+#   type    = "A"
+#   ttl     = "${var.subdomain_ttl}"
+#   records = ["${aws_instance.openvpn.public_ip}"]
+# }
 
 variable "ami" {
   default = "ami-f53d7386" // ubuntu xenial openvpn ami in eu-west-1
 }
 
 variable "instance_type" {
-  default = "t2.medium"
+  default = "t2.micro"
 }
 
 variable "admin_user" {
@@ -175,7 +186,8 @@ resource "aws_instance" "openvpn" {
   key_name                    = "${aws_key_pair.openvpn.key_name}"
   subnet_id                   = "${aws_subnet.vpn_subnet.id}"
   vpc_security_group_ids      = ["${aws_security_group.openvpn.id}"]
-  associate_public_ip_address = true
+  associate_public_ip_address = false
+  source_dest_check = false
 
   # `admin_user` and `admin_pw` need to be passed in to the appliance through `user_data`, see docs -->
   # https://docs.openvpn.net/how-to-tutorialsguides/virtual-platforms/amazon-ec2-appliance-ami-quick-start-guide/
@@ -187,17 +199,22 @@ USERDATA
 
 variable "certificate_email" {}
 
+resource "aws_eip_association" "eip_assoc" {
+  instance_id   = "${aws_instance.openvpn.id}"
+  allocation_id = "${aws_eip.openvpn_eip.id}"
+}
+
 resource "null_resource" "provision_openvpn" {
   triggers {
-    subdomain_id = "${aws_route53_record.vpn.id}"
+    instance_id = "${aws_instance.openvpn.id}"
   }
 
   connection {
     type        = "ssh"
-    host        = "${aws_instance.openvpn.public_ip}"
+    host        = "${aws_eip.openvpn_eip.public_ip}"
     user        = "${var.ssh_user}"
     port        = "${var.ssh_port}"
-    private_key = "${var.private_key}"
+    private_key = "${file("key")}"
     agent       = false
   }
 
@@ -206,9 +223,10 @@ resource "null_resource" "provision_openvpn" {
       "sudo apt-get install -y curl vim libltdl7 python3 python3-pip python software-properties-common unattended-upgrades",
       "sudo add-apt-repository -y ppa:certbot/certbot",
       "sudo apt-get -y update",
-      "sudo apt-get -y install python-certbot certbot",
+      "sudo sysctl -w net.ipv4.ip_forward=1",
+      "sudo apt-get -y install python-certbot-apache certbot",
       "sudo service openvpnas stop",
-      "sudo certbot certonly --standalone --non-interactive --agree-tos --email ${var.certificate_email} --domains ${var.subdomain_name} --pre-hook 'service openvpnas stop' --post-hook 'service openvpnas start'",
+      "sudo certbot certonly --standalone --non-interactive --agree-tos --email ${var.certificate_email} --domains ${var.subdomain_name} --pre-hook 'service openvpnas stop;service apache2 stop' --post-hook 'service openvpnas start;service apache2 start'",
       "sudo ln -s -f /etc/letsencrypt/live/${var.subdomain_name}/cert.pem /usr/local/openvpn_as/etc/web-ssl/server.crt",
       "sudo ln -s -f /etc/letsencrypt/live/${var.subdomain_name}/privkey.pem /usr/local/openvpn_as/etc/web-ssl/server.key",
       "sudo service openvpnas start",
